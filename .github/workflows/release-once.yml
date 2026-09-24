@@ -1,0 +1,138 @@
+name: Build ChuAng release once
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Build and package Linux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
+          case "$platform" in
+            amd64) bootlin_arch=x86-64; export GOARCH=amd64 ;;
+            arm64) bootlin_arch=aarch64; export GOARCH=arm64 ;;
+          esac
+          base="https://toolchains.bootlin.com/downloads/releases/toolchains/$bootlin_arch/tarballs"
+          archive=$(curl -fsSL --retry 5 "$base/" |
+            grep -oE "${bootlin_arch}--musl--stable-[^\"]+\.tar\.xz" |
+            sort -r | head -n1)
+          test -n "$archive"
+          curl -fL --retry 5 -o "$RUNNER_TEMP/$archive" "$base/$archive"
+          tar -xf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          toolchain=$(find "$RUNNER_TEMP" -maxdepth 1 -type d \
+            -name "${bootlin_arch}--musl--stable-*" | head -n1)
+          test -n "$toolchain"
+          export PATH="$toolchain/bin:$PATH"
+          compiler=$(find "$toolchain/bin" -name '*-gcc.br_real' -type f -executable | head -n1)
+          test -n "$compiler"
+          export CC="$compiler" CGO_ENABLED=1 GOOS=linux
+          go build -buildvcs=true -ldflags="-w -s -linkmode external -extldflags '-static'" -o x-ui-binary .
+          mkdir -p x-ui/bin
+          mv x-ui-binary x-ui/x-ui
+          cp x-ui.sh x-ui.service.debian x-ui.service.arch x-ui.service.rhel x-ui/
+          file x-ui/x-ui
+          if ldd x-ui/x-ui 2>&1 | grep -qE 'libc\.so|ld-linux'; then
+            echo "The binary is not statically linked" >&2
+            exit 1
+          fi
+
+          cd x-ui/bin
+          xray_base="https://github.com/XTLS/Xray-core/releases/download/v26.9.9"
+          if [[ "$platform" == amd64 ]]; then
+            xray_asset=Xray-linux-64.zip
+          else
+            xray_asset=Xray-linux-arm64-v8a.zip
+          fi
+          curl -fL --retry 5 -o "$xray_asset" "$xray_base/$xray_asset"
+          unzip -q "$xray_asset"
+          rm -f "$xray_asset" geoip.dat geosite.dat
+          mv xray "xray-linux-$platform"
+          curl -fL --retry 5 -o geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -fL --retry 5 -o geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          curl -fL --retry 5 -o geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat
+          curl -fL --retry 5 -o geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
+          curl -fL --retry 5 -o geoip_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -fL --retry 5 -o geosite_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+
+          mtg_tag=$(curl -fsSL --retry 5 -o /dev/null -w '%{url_effective}' https://github.com/mhsanaei/mtg-multi/releases/latest)
+          mtg_tag="${mtg_tag##*/}"
+          [[ "$mtg_tag" == v* ]]
+          mtg_package="mtg-multi-${mtg_tag#v}-linux-$platform"
+          curl -fL --retry 5 -o "$mtg_package.tar.gz" \
+            "https://github.com/mhsanaei/mtg-multi/releases/download/$mtg_tag/$mtg_package.tar.gz"
+          tar -xzf "$mtg_package.tar.gz"
+          mv "$mtg_package/mtg-multi" "mtg-linux-$platform"
+          rm -r "$mtg_package" "$mtg_package.tar.gz"
+          if [[ "$platform" == amd64 ]]; then
+            tuic_arch=x86_64
+          else
+            tuic_arch=aarch64
+          fi
+          curl -fL --retry 5 -o tuic-server \
+            "https://github.com/EAimTY/tuic/releases/download/tuic-server-1.0.0/tuic-server-1.0.0-${tuic_arch}-unknown-linux-musl"
+          chmod +x tuic-server
+          cd ../..
+          tar -czf "x-ui-linux-$platform.tar.gz" x-ui
+          sha256sum "x-ui-linux-$platform.tar.gz" > "x-ui-linux-$platform.tar.gz.sha256"
+          test -s "x-ui-linux-$platform.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.platform }}
+          path: |
+            x-ui-linux-${{ matrix.platform }}.tar.gz
+            x-ui-linux-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: release-files
+          merge-multiple: true
+      - name: Verify and publish stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-files
+          for checksum in *.sha256; do sha256sum -c "$checksum"; done
+          test -f x-ui-linux-amd64.tar.gz
+          test -f x-ui-linux-arm64.tar.gz
+          if gh release view v3.0.0 >/dev/null 2>&1; then
+            echo "Release v3.0.0 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          gh release create v3.0.0 ./*.tar.gz ./*.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "ChuAng v3.0.0" \
+            --notes "ChuAng 3x-ui Chinese installer, Linux amd64 and arm64. Includes SHA-256 checksums."
